@@ -2,6 +2,20 @@
 See =(info "(standards) NEWS File")=. User facing changes per release
 are to be recorded here.
 
+* 7800uk fork
+- Remote documents over TRAMP, rendered from a local cache;
+  =emureader-open-doc= and the new =emureader-find-doc-noselect= take an
+  optional NAME for documents stored without an extension;
+  =emureader-clear-cache=.
+- SyncTeX forward and inverse search (=emureader-synctex.el=), with the
+  AUCTeX viewer "EμReader".
+- org-noter support (=emureader-org-noter.el=).
+- =emureader-after-page-change-hook=; page positions as fractions
+  (=emureader-posn-page-fraction=, =emureader-page-fraction-to-window=,
+  =emureader-flash-position=).
+- Opening a document without showing it no longer scrolls the selected
+  window, and the page is fitted when first shown.
+
 * Version 0.4.0
 - Rename to EMuReader.
 - Per window pages, zooming, etc. support, which means that it is now

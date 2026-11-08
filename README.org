@@ -26,6 +26,25 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 An all-in-one document reader for GNU Emacs, supporting all [[* Supported Formats][major document formats]]. This package intends to take from =doc-view=, =nov.el=, and =pdf-tools= and make them better. And as such, it is effectively a *drop-in replacement* for them.
 
+* About this fork
+This is the 7800uk fork of EμReader, kept at https://gitlab.7800.io/7800uk/emureader. GitLab push-mirrors it to https://github.com/7800uk/emureader, which you can also install from but should not push to. It follows upstream (https://codeberg.org/MonadicSheep/emureader) and adds three features, all in Emacs Lisp; the dynamic module is upstream's, unchanged:
+
+- [[* Remote documents (TRAMP)][Remote documents]] over TRAMP, through a local cache that can name documents stored without an extension;
+- [[* SyncTeX][SyncTeX]] forward and inverse search, with an AUCTeX viewer;
+- [[* org-noter][org-noter]] support.
+
+What each feature must do is written down in [[file:doc/fork-spec.org][doc/fork-spec.org]]; =make test= runs the batch tests.
+
+With straight.el,
+#+begin_src emacs-lisp
+  (use-package emureader
+    :straight (emureader :type git :host nil
+                         :repo "https://gitlab.7800.io/7800uk/emureader.git"
+                         :files ("*.el" "emureader-dyn.so" "emureader-dyn.dylib")
+                         :pre-build ("make" "module")))
+#+end_src
+or, from the mirror, =:host github :repo "7800uk/emureader"=.
+
 * EMuReader at Emacsconf 2025
 
 [[https://media.emacsconf.org/2025/emacsconf-2025-reader--an-introduction-to-the-emacs-reader--divy--main.webm]]
@@ -130,6 +149,57 @@ To test emureader in a default Emacs config, first generate the auto loads using
 #+end_src
 This command adds the current directory to path, and loads =emureader-autoloads.el=.
 
+* Remote documents (TRAMP)
+MuPDF opens documents by local path, so a remote document is copied into =emureader-cache-directory= (by default =~/.emacs.d/emureader-cache/=) and the copy is rendered.  The buffer still visits the remote file: =buffer-file-name= is the remote name, the buffer-local =emureader-cache-file= names the copy.
+
+- =find-file= on a remote document with a known extension opens it in EμReader.  The bytes =find-file= already fetched are written to the cache, so the document is not transferred twice.
+- =(emureader-open-doc FILE &optional NAME)= opens FILE, local or remote, and shows it.  =(emureader-find-doc-noselect FILE &optional NAME)= returns the buffer without showing it.  NAME names the buffer and the cached copy, and its extension sets the format.  This is for servers that store documents under content-addressed names without an extension:
+  #+begin_src emacs-lisp
+    (emureader-open-doc "/ssh:host:/var/lib/altero/storage/c3/c3abde0f9625c3b2f48dc1586671f47b"
+                        "Kripke - Naming and Necessity.pdf")
+  #+end_src
+  Without NAME, the remote file's own name is used; when that has no known extension, the format is guessed from the contents (PDF, EPUB, MOBI, FB2, ODF).  Interactively, =C-u M-x emureader-open-doc= offers every file and asks for NAME.
+- The copy lives in a subdirectory named after a hash of the remote file name.  It is reused while its size and modification time match the remote file's.  Reverting (=g=) fetches it again if the remote file changed.
+- =M-x emureader-clear-cache= deletes the copies not shown by a live buffer; with a prefix argument, all of them.
+- Bookmarks of remote documents remember NAME and reopen through the cache.
+
+Nothing is ever written to the remote side.
+
+* SyncTeX
+=emureader-synctex.el= correlates a PDF shown in EμReader with its LaTeX source.  It uses the =synctex= command line tool and the =.synctex.gz= file that =pdflatex -synctex=1= writes (=latexmk= and AUCTeX's =TeX-source-correlate-mode= ask for it).
+
+- *Forward search*, =M-x emureader-synctex-forward-search=: from a line of the source to its place in the PDF.  The PDF is shown in another window (=emureader-synctex-display-action=), reverted first if it was recompiled, turned to the right page and scrolled to the line.  The line's box is then highlighted for =emureader-flash-duration= seconds (face =emureader-flash=, opacity =emureader-flash-opacity=).
+- *Inverse search*, =C-mouse-1= on the page, or =C-c C-g= for the spot at the window's centre: visits the source line in another window (=emureader-synctex-source-display-action=).
+
+Both take the zoom and rotation of the window into account.
+
+With AUCTeX, the viewer "EμReader" is added to =TeX-view-program-list= once =tex= is loaded, so one setting makes =C-c C-v= (=TeX-view=) do a forward search:
+#+begin_src emacs-lisp
+  (with-eval-after-load 'tex
+    (require 'emureader-synctex)
+    (setq TeX-view-program-selection
+          (cons '(output-pdf "EμReader")
+                (assq-delete-all 'output-pdf TeX-view-program-selection)))
+    (TeX-source-correlate-mode 1))
+#+end_src
+Without =TeX-source-correlate-mode=, =C-c C-v= just shows the PDF.  Forward search from the region file (=C-c C-r=) is not supported.
+
+* org-noter
+=emureader-org-noter.el= lets [[https://github.com/org-noter/org-noter][org-noter]] (1.6) annotate documents shown in EμReader:
+#+begin_src emacs-lisp
+  (with-eval-after-load 'org-noter
+    (require 'emureader-org-noter))
+#+end_src
+
+- Sessions start from a notes heading (=NOTER_DOCUMENT=) or from an EμReader buffer with =M-x org-noter=, and the notes follow the document's page.
+- Locations are =(PAGE . V)= or =(PAGE V . H)=, V and H being fractions of the page as with PDF Tools, so notes carry over.  =org-noter-insert-note= records the page; =org-noter-insert-precise-note= asks for a click on the page and records where, and going to such a note scrolls there and points an arrow at it.
+- =org-noter-create-skeleton= turns the document's outline into headings.
+- A remote =NOTER_DOCUMENT= opens through the cache, even without an extension; the notes record the remote name.
+
+EμReader has no text selection yet, so notes get no text from the document.
+
+Packages can follow page changes with =emureader-after-page-change-hook=, which this uses.
+
 * Key Bindings
 - =n= for going to next page
 - =p=  for going to previous page
@@ -148,6 +218,7 @@ This command adds the current directory to path, and loads =emureader-autoloads.
 - =-= and =C-<wheel-down>= for zooming out of the page.
 - =H= to make the page fit the height of the current window.
 - =W= to make the page fit the width of the current window.
+- =C-mouse-1= and =C-c C-g= for SyncTeX inverse search (this fork).
 
 * How It Works
 This package is entirely distinct from =DocView= and =pdf-tools= in both its architecture and implementation. It leverages Emacs’ dynamic/native modules which allows it to interoperate with other programming languages outside of its Emacs Lisp environment.
