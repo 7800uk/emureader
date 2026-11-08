@@ -130,6 +130,10 @@
 (defvar-local emureader--recent-scale-fallback 1.0
   "Previous scaling factor applied to the document.")
 
+(defvar-local emureader--fit-pending nil
+  "Non-nil if the document was opened without being shown.
+The page is then fitted to the first window showing it.")
+
 (defvar-local emureader--reloading nil
   "Boolean flag to represent reloading status of a document.")
 
@@ -241,71 +245,320 @@ for actual definition."
 	 (emureader--enqueue-command #',(intern non-queue-function-name)
 				     ,(remq '&optional (push 'list arglist)))))))
 
-(defun emureader--read-doc-name ()
-  "Read a document file name."
-  (let* ((regexp (regexp-opt emureader-supported-formats t))
+(defun emureader--read-doc-name (&optional any)
+  "Read a document file name.
+Unless ANY is non-nil, only offer files with a supported extension."
+  (let* ((regexp (concat "\\." (regexp-opt emureader-supported-formats t) "\\'"))
 	 (prompt "Open document: ")
 	 (file (read-file-name
 		prompt nil nil t nil
 		(lambda (f)
-		  (or (file-directory-p f)
+		  (or any
+		      (file-directory-p f)
 		      (string-match-p regexp f))))))
     (if (file-directory-p file)
-	(emureader--read-doc-name) file)))
+	(emureader--read-doc-name any) file)))
+
+;;; Remote documents
+;;
+;; MuPDF opens documents by local path, so a remote document (see
+;; `file-remote-p') is copied into `emureader-cache-directory' and the
+;; copy is rendered.  The buffer still visits the remote file:
+;; `buffer-file-name' is the remote file name, while
+;; `emureader-cache-file' names the local copy.  The copy is stored
+;; under a real file name, NAME, so that documents kept on servers
+;; under content-addressed names without an extension still get the
+;; right format.
+
+(defcustom emureader-cache-directory
+  (expand-file-name "emureader-cache/" user-emacs-directory)
+  "Directory holding local copies of remote documents.
+
+Each remote document gets a subdirectory named after a hash of its
+remote file name, holding the copy under the document's name."
+  :type 'directory)
+
+(defvar-local emureader-doc-name nil
+  "Name of the document shown in the current buffer.
+It names the buffer and, for remote documents, the cached copy.  When
+nil, the non-directory part of the variable `buffer-file-name' is used.")
+(put 'emureader-doc-name 'permanent-local t)
+
+(defvar-local emureader-cache-file nil
+  "Local copy of the remote document visited by the current buffer.
+It is nil for local documents.")
+(put 'emureader-cache-file 'permanent-local t)
+
+(defun emureader--supported-extension-p (file)
+  "Non-nil if FILE has an extension in `emureader-supported-formats'."
+  (when-let* ((ext (file-name-extension file)))
+    (member (downcase ext) emureader-supported-formats)))
+
+(defun emureader--sniff-extension (file)
+  "Guess the extension of local FILE from its first bytes, or return nil."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file nil 0 128)
+    (goto-char (point-min))
+    (cond ((looking-at-p "%PDF-") "pdf")
+	  ((looking-at-p "AT&TFORM") nil)
+	  ((looking-at-p "PK\003\004")
+	   (cond ((search-forward "mimetypeapplication/epub+zip" nil t) "epub")
+		 ((search-forward "[Content_Types].xml" nil t) nil)
+		 ((search-forward "mimetypeapplication/vnd.oasis.opendocument." nil t)
+		  (cond ((looking-at-p "text") "odt")
+			((looking-at-p "spreadsheet") "ods")
+			((looking-at-p "presentation") "odp")
+			((looking-at-p "graphics") "odg")))))
+	  ((looking-at-p "BOOKMOBI") "mobi")
+	  ((looking-at-p "\\(?:\357\273\277\\)?<\\?xml") "fb2"))))
+
+(defun emureader--cache-name (name)
+  "Return NAME made safe for use as a local file name."
+  (let ((name (replace-regexp-in-string "[/\\:\0]" "_" name)))
+    (if (string-match-p "\\`\\.*\\'" name) "document" name)))
+
+(defun emureader--cache-subdirectory (file)
+  "Return the cache subdirectory for remote FILE."
+  (file-name-as-directory
+   (expand-file-name (md5 file) emureader-cache-directory)))
+
+(defun emureader--cache-fresh-p (cache attributes)
+  "Non-nil if local CACHE matches the remote file ATTRIBUTES."
+  (when-let* ((local (and cache (file-attributes cache))))
+    (and (eql (file-attribute-size local)
+	      (file-attribute-size attributes))
+	 (time-equal-p (file-attribute-modification-time local)
+		       (file-attribute-modification-time attributes)))))
+
+(defun emureader--cache-candidates (dir name)
+  "Return the cache file names in DIR that may hold document NAME."
+  (cons (expand-file-name name dir)
+	(unless (emureader--supported-extension-p name)
+	  (mapcar (lambda (ext) (expand-file-name (concat name "." ext) dir))
+		  emureader-supported-formats))))
+
+(defun emureader--cache-write-buffer (buffer cache attributes)
+  "Write the raw bytes held by BUFFER to CACHE, if that is safe.
+Return non-nil when CACHE was written and has the size recorded in
+the remote file ATTRIBUTES."
+  (with-current-buffer buffer
+    (when (and (> (buffer-size) 0)
+	       buffer-file-coding-system
+	       (memq (coding-system-base buffer-file-coding-system)
+		     '(no-conversion raw-text))
+	       (eql (coding-system-eol-type buffer-file-coding-system) 0))
+      (save-restriction
+	(widen)
+	(let ((coding-system-for-write 'no-conversion)
+	      (write-region-inhibit-fsync t))
+	  (write-region nil nil cache nil 'silent)))
+      (or (eql (file-attribute-size (file-attributes cache))
+	       (file-attribute-size attributes))
+	  (progn (delete-file cache) nil)))))
+
+(defun emureader-cache-fetch (file &optional name buffer)
+  "Return a local copy of remote FILE, fetching it when needed.
+
+The copy lives in a subdirectory of `emureader-cache-directory' and is
+called NAME, which defaults to FILE's non-directory name.  When
+neither has a supported extension, the format is guessed from the
+contents and its extension appended.  An existing copy is reused when
+its size and modification time match FILE's.
+
+If BUFFER is non-nil and holds FILE's undecoded bytes, they are
+written to the cache instead of copying FILE again."
+  (let* ((remote-file-name-inhibit-cache t)
+	 (attributes (or (file-attributes file)
+			 (user-error "Remote document not found: %s" file)))
+	 (dir (emureader--cache-subdirectory file))
+	 (name (emureader--cache-name
+		(or name (file-name-nondirectory file))))
+	 (cache (expand-file-name name dir)))
+    (when (eq t (file-attribute-type attributes))
+      (user-error "Not a document: %s" file))
+    (or (seq-find (lambda (f) (emureader--cache-fresh-p f attributes))
+		  (emureader--cache-candidates dir name))
+	(let ((part (expand-file-name (concat ".fetch-" name) dir)))
+	  (make-directory dir t)
+	  ;; Old versions of the document are no longer needed.
+	  (dolist (old (directory-files dir t directory-files-no-dot-files-regexp))
+	    (when (file-regular-p old)
+	      (delete-file old)))
+	  (unless (and buffer (emureader--cache-write-buffer buffer part attributes))
+	    (message "Fetching %s..." file)
+	    (copy-file file part t))
+	  (unless (emureader--supported-extension-p name)
+	    (when-let* ((ext (emureader--sniff-extension part)))
+	      (setq cache (concat cache "." ext))))
+	  (rename-file part cache t)
+	  (set-file-times cache (file-attribute-modification-time attributes))
+	  cache))))
+
+(defun emureader--local-file (&optional recheck)
+  "Return the local file that renders the current buffer's document.
+
+For a remote document this is the cached copy, fetched when missing.
+If RECHECK is non-nil, also fetch it again when the remote file
+changed."
+  (when-let* ((file buffer-file-name))
+    (if (not (file-remote-p file))
+	file
+      (when (or recheck
+		(not (and emureader-cache-file
+			  (file-exists-p emureader-cache-file))))
+	(setq emureader-cache-file
+	      (emureader-cache-fetch
+	       file emureader-doc-name
+	       ;; Bytes inserted by `find-file' can be reused once.
+	       (and (not emureader-cache-file) (current-buffer)))))
+      emureader-cache-file)))
 
 ;;;###autoload
-(defun emureader-open-doc (document)
+(defun emureader-clear-cache (&optional all)
+  "Delete the local copies of remote documents.
+
+Copies shown by live EμReader buffers are kept unless ALL is non-nil
+\(interactively, with a prefix argument)."
+  (interactive "P")
+  (let ((keep (unless all
+		(delq nil (mapcar (lambda (buf)
+				    (buffer-local-value 'emureader-cache-file buf))
+				  (buffer-list)))))
+	(count 0))
+    (when (file-directory-p emureader-cache-directory)
+      (dolist (dir (directory-files emureader-cache-directory t
+				    directory-files-no-dot-files-regexp))
+	(when (file-directory-p dir)
+	  (dolist (file (directory-files dir t directory-files-no-dot-files-regexp))
+	    (unless (member file keep)
+	      (delete-file file)
+	      (setq count (1+ count))))
+	  (when (directory-empty-p dir)
+	    (delete-directory dir)))))
+    (when (called-interactively-p 'interactive)
+      (message "Deleted %d cached document%s" count (if (= count 1) "" "s")))
+    count))
+
+;;;###autoload
+(defun emureader-find-doc-noselect (document &optional name)
+  "Return a buffer showing DOCUMENT in `emureader-mode', without selecting it.
+
+DOCUMENT may be a remote file, in which case it is rendered from a
+local copy; see `emureader-cache-fetch'.  NAME, when non-nil, names
+the buffer and the local copy, and its extension sets the format.
+This allows opening documents stored without an extension, as in
+\(emureader-find-doc-noselect \"/ssh:host:/store/ab/ab12…\" \"Paper.pdf\").
+
+An existing buffer visiting DOCUMENT is reused."
+  (let ((document (expand-file-name document)))
+    (or (seq-find (lambda (buf)
+		    (and (equal (buffer-local-value 'buffer-file-name buf) document)
+			 (eq (buffer-local-value 'major-mode buf) 'emureader-mode)))
+		  (buffer-list))
+	(let ((buffer (create-file-buffer
+		       (or name (file-name-nondirectory document)))))
+	  (with-current-buffer buffer
+	    (setq buffer-file-name document
+		  buffer-file-truename (abbreviate-file-name document)
+		  emureader-doc-name name
+		  default-directory (file-name-directory document))
+	    (unless (file-remote-p document)
+	      (set-visited-file-modtime))
+	    ;; We need something to put the overlay on.
+	    (insert "\n")
+	    ;; go back to the previous point for page border.
+	    (goto-char (1- (point)))
+	    (set-buffer-modified-p nil)
+	    (condition-case err
+		(emureader-mode)
+	      (error (when (buffer-live-p buffer)
+		       (kill-buffer buffer))
+		     (signal (car err) (cdr err)))))
+	  (and (buffer-live-p buffer) buffer)))))
+
+;;;###autoload
+(defun emureader-open-doc (document &optional name)
   "Open DOCUMENT for viewing.
 
-This function calls the module function `emureader-dyn--load-doc' from the
-dynamic module to render the first page and displays it in a new buffer.
+DOCUMENT may be local or remote.  NAME, when non-nil, is the name
+under which the document is shown and, for a remote document, cached;
+its extension determines the format.  Interactively, a prefix
+argument offers every file and prompts for NAME.
 
-The only formats that can be opened `emureader-supported-formats', any
-other file format will simply not show up as a candidate."
-  (interactive (list (expand-file-name (emureader--read-doc-name))))
-  (switch-to-buffer (create-file-buffer document))
-  (setq buffer-file-name document)
-  ;; We need something to put the overlay on.
-  (insert "\n")
-  ;; go back to the previous point for page border.
-  (goto-char (1- (point)))
-  (if (emureader-dyn--load-doc (expand-file-name document) 0)
-      (emureader-mode)
-    (kill-buffer (current-buffer))))
+The document is rendered by the dynamic module, see
+`emureader-find-doc-noselect'.  Without a prefix argument, the only
+formats offered are `emureader-supported-formats'."
+  (interactive
+   (let ((file (expand-file-name (emureader--read-doc-name current-prefix-arg))))
+     (list file
+	   (when current-prefix-arg
+	     (let ((name (read-string "Document name: "
+				      (file-name-nondirectory file))))
+	       (unless (string-empty-p name) name))))))
+  (when-let* ((buffer (emureader-find-doc-noselect document name)))
+    (switch-to-buffer buffer)))
+
+;;; Page changes
+
+(defvar emureader-after-page-change-hook nil
+  "Hook run after the page shown in a window changes.
+It runs with the document's buffer current and the window selected.")
+
+(defvar emureader--inhibit-page-change-hook nil
+  "Non-nil while `emureader-after-page-change-hook' must not run.")
+
+(defun emureader--page-changed (old)
+  "Run `emureader-after-page-change-hook' unless the page is still OLD."
+  (unless (or emureader--inhibit-page-change-hook
+	      (eql old (emureader-current-doc-pagenumber (selected-window))))
+    (run-hooks 'emureader-after-page-change-hook)))
+
+(defmacro emureader--with-page-change (&rest body)
+  "Run BODY, then the page change hook if the page changed.
+Return the value of BODY."
+  (declare (indent 0) (debug t))
+  (let ((old (make-symbol "old")))
+    `(let ((,old (emureader-current-doc-pagenumber (selected-window))))
+       (prog1 (progn ,@body)
+	 (emureader--page-changed ,old)))))
 
 (define-queue-command next-page ()
   "Go to the next page of the document."
   (interactive)
-  (when (emureader-dyn--next-page)
+  (when (emureader--with-page-change (emureader-dyn--next-page))
     ;; Must return `t' when the command succeeds.
     (force-mode-line-update) t))
 
 (define-queue-command previous-page ()
   "Go to the previous page of the document."
   (interactive)
-  (when (emureader-dyn--prev-page)
+  (when (emureader--with-page-change (emureader-dyn--prev-page))
     ;; Must return `t' when the command succeeds.
     (force-mode-line-update) t))
 
 (defun emureader-first-page ()
   "Go to the first page of the document."
   (interactive)
-  (emureader-dyn--first-page)
-  (emureader--center-page)
+  (emureader--with-page-change
+    (emureader-dyn--first-page)
+    (emureader--center-page))
   (force-mode-line-update))
 
 (defun emureader-last-page ()
   "Go to the last page of the document."
   (interactive)
-  (emureader-dyn--last-page)
-  (emureader--center-page)
+  (emureader--with-page-change
+    (emureader-dyn--last-page)
+    (emureader--center-page))
   (force-mode-line-update))
 
 (defun emureader-goto-page (n)
   "Go to page number N in the current document."
   (interactive "nGoto page: ")
-  (emureader-dyn--goto-page (- n 1)) ; MuPDF does 0-indexing
-  (emureader--center-page))
+  (emureader--with-page-change
+    (emureader-dyn--goto-page (- n 1)) ; MuPDF does 0-indexing
+    (emureader--center-page)))
 
 (defun emureader--get-current-doc-image-size (&optional window)
   "Get the dimensions of the page in WINDOW.
@@ -697,15 +950,260 @@ See also `emureader-shrink-size'."
   "Rotate the current window's view by 90 degrees, clockwise."
   (interactive)
   (let ((inhibit-quit t))
-    (emureader-dyn--rotate-page 90)
+    (when (emureader-dyn--rotate-page 90)
+      (emureader--note-rotation 90))
     (emureader--center-page)))
 
 (defun emureader-rotate-counter-clockwise ()
   "Rotate the current window's view by 90 degrees, counter-clockwise."
   (interactive)
   (let ((inhibit-quit t))
-    (emureader-dyn--rotate-page -90)
+    (when (emureader-dyn--rotate-page -90)
+      (emureader--note-rotation -90))
     (emureader--center-page)))
+
+;;; Positions on the page
+;;
+;; The module renders a page of W x H points at scale S into an image
+;; of W*S/F x H*S/F pixels, F being `frame-scale-factor', rotated
+;; clockwise by the window's rotation.  These functions convert
+;; between positions in a window and positions on the page, given as
+;; fractions of the unrotated page's width and height (0 is the left
+;; or top edge).
+
+(defun emureader--note-rotation (degrees)
+  "Record that the selected window's view was rotated by DEGREES."
+  (set-window-parameter
+   nil 'emureader-rotation
+   (mod (+ (or (window-parameter nil 'emureader-rotation) 0) degrees) 360)))
+
+(defun emureader-current-doc-rotation (&optional window)
+  "Clockwise rotation of the page in WINDOW, in degrees."
+  (or (window-parameter window 'emureader-rotation) 0))
+
+(defun emureader--rotate-fraction (x y rotation)
+  "Map the unrotated page fraction X, Y to the page shown at ROTATION.
+Return a cons of fractions of the shown image."
+  (pcase (mod rotation 360)
+    (90  (cons (- 1 y) x))
+    (180 (cons (- 1 x) (- 1 y)))
+    (270 (cons y (- 1 x)))
+    (_   (cons x y))))
+
+(defun emureader--unrotate-fraction (x y rotation)
+  "Map the fraction X, Y of the image shown at ROTATION to the page.
+This is the inverse of `emureader--rotate-fraction'."
+  (pcase (mod rotation 360)
+    (90  (cons y (- 1 x)))
+    (180 (cons (- 1 x) (- 1 y)))
+    (270 (cons (- 1 y) x))
+    (_   (cons x y))))
+
+(defun emureader-current-doc-page-size (&optional window)
+  "Size of the unrotated page shown in WINDOW, as (WIDTH . HEIGHT) in points."
+  (let* ((window (or window (selected-window)))
+	 (size (emureader--get-current-doc-image-size window))
+	 (factor (/ (float (frame-scale-factor (window-frame window)))
+		    (emureader-current-doc-scale-value window)))
+	 (w (* (car size) factor))
+	 (h (* (cdr size) factor)))
+    (if (memq (emureader-current-doc-rotation window) '(90 270))
+	(cons h w)
+      (cons w h))))
+
+(defun emureader-posn-page-fraction (posn)
+  "Return the page position under POSN as fractions (X . Y) of the page.
+POSN is a position as returned by `event-start' or `posn-at-x-y'.
+Return nil unless POSN is on a document page."
+  (when-let* ((window (posn-window posn))
+	      (_ (windowp window))
+	      (_ (emureader--window-owned-p window))
+	      (object-xy (posn-object-x-y posn))
+	      (_ (consp (posn-image posn)))
+	      (size (emureader--get-current-doc-image-size window)))
+    (emureader--unrotate-fraction
+     (/ (float (car object-xy)) (car size))
+     (/ (float (cdr object-xy)) (cdr size))
+     (emureader-current-doc-rotation window))))
+
+(defun emureader--image-origin (&optional window)
+  "Return the position of the page image's top left corner in WINDOW.
+The value is (X . Y) in pixels relative to WINDOW's text area; it is
+negative when that corner is scrolled out of view."
+  (let* ((window (or window (selected-window)))
+	 (prefix (or (emureader--get-prefix-width window) 0))
+	 (hscroll (* (window-hscroll window)
+		     (emureader--get-pixel-per-col window))))
+    (cons (- prefix hscroll)
+	  (- (window-vscroll window t)))))
+
+(defun emureader-page-fraction-to-window (x y &optional window)
+  "Return the pixel position in WINDOW of the page fractions X, Y.
+The value is (PX . PY), relative to WINDOW's text area."
+  (let* ((window (or window (selected-window)))
+	 (shown (emureader--rotate-fraction
+		 x y (emureader-current-doc-rotation window)))
+	 (size (emureader--get-current-doc-image-size window))
+	 (origin (emureader--image-origin window)))
+    (cons (round (+ (car origin) (* (car shown) (car size))))
+	  (round (+ (cdr origin) (* (cdr shown) (cdr size)))))))
+
+(defun emureader-scroll-to-page-fraction (x y &optional window)
+  "Scroll WINDOW so that page fractions X, Y are visible.
+The position is put about a third of the way down the window, and
+horizontally into view when the page is wider than the window."
+  (let* ((window (or window (selected-window)))
+	 (shown (emureader--rotate-fraction
+		 x y (emureader-current-doc-rotation window)))
+	 (size (emureader--get-current-doc-image-size window))
+	 (target-y (* (cdr shown) (cdr size)))
+	 (height (window-body-height window t)))
+    (with-selected-window window
+      (emureader--set-window-vscroll
+       window (max 0 (round (- target-y (/ height 3)))) t)
+      (when (> (car size) (window-body-width window t))
+	(let* ((target-x (* (car shown) (car size)))
+	       (width (window-body-width window t))
+	       (col (/ (max 0 (- target-x (/ width 3)))
+		       (emureader--get-pixel-per-col window))))
+	  (emureader--set-window-hscroll window (round col)))))))
+
+(defface emureader-flash
+  '((((background dark)) :background "#e5c07b" :foreground "#e5c07b")
+    (t :background "#ffd700" :foreground "#c04000"))
+  "Face of the marks put on the page by `emureader-flash-position'.
+The background colours the box highlighted over the page, the
+foreground the arrow pointing at a position."
+  :group 'emureader)
+
+(defcustom emureader-flash-duration 1.5
+  "Seconds for which `emureader-flash-position' marks the page."
+  :type 'number)
+
+(defcustom emureader-flash-opacity 0.4
+  "Opacity, from 0 to 1, of the box highlighted by `emureader-flash-position'."
+  :type 'number)
+
+(defvar emureader--flash-frame nil
+  "Child frame used to mark positions on the page.")
+
+(defvar emureader--flash-timer nil
+  "Timer hiding `emureader--flash-frame'.")
+
+(defun emureader--flash-hide ()
+  "Hide the mark put on the page by `emureader-flash-position'."
+  (when (timerp emureader--flash-timer)
+    (cancel-timer emureader--flash-timer))
+  (setq emureader--flash-timer nil)
+  (when (frame-live-p emureader--flash-frame)
+    (make-frame-invisible emureader--flash-frame t)))
+
+(defun emureader--flash-frame (parent)
+  "Return the child frame of PARENT used to mark positions."
+  (unless (and (frame-live-p emureader--flash-frame)
+	       (eq (frame-parent emureader--flash-frame) parent))
+    (when (frame-live-p emureader--flash-frame)
+      (delete-frame emureader--flash-frame t))
+    (let ((buffer (get-buffer-create " *emureader-flash*")))
+      (with-current-buffer buffer
+	(setq-local mode-line-format nil
+		    header-line-format nil
+		    tab-line-format nil
+		    cursor-type nil
+		    cursor-in-non-selected-windows nil
+		    truncate-lines t
+		    ;; Global modes would draw in the frame.
+		    display-line-numbers nil
+		    display-fill-column-indicator nil
+		    show-trailing-whitespace nil
+		    indicate-empty-lines nil
+		    indicate-buffer-boundaries nil
+		    global-hl-line-mode nil))
+      (setq emureader--flash-frame
+	    (let ((after-make-frame-functions nil)
+		  (display-buffer-alist nil))
+	      (make-frame
+	       `((parent-frame . ,parent)
+		 (minibuffer . nil)
+		 (undecorated . t)
+		 (no-accept-focus . t)
+		 (no-focus-on-map . t)
+		 (no-other-frame . t)
+		 (no-special-glyphs . t)
+		 (cursor-type . nil)
+		 (right-divider-width . 0)
+		 (bottom-divider-width . 0)
+		 (unsplittable . t)
+		 (skip-taskbar . t)
+		 (visibility . nil)
+		 (internal-border-width . 0)
+		 (child-frame-border-width . 0)
+		 (left-fringe . 0)
+		 (right-fringe . 0)
+		 (vertical-scroll-bars . nil)
+		 (horizontal-scroll-bars . nil)
+		 (menu-bar-lines . 0)
+		 (tool-bar-lines . 0)
+		 (tab-bar-lines . 0)
+		 (line-spacing . 0)
+		 ;; A tiny font lets the frame be as short as a line of
+		 ;; the document.
+		 (font . ,(font-spec :family (face-attribute 'default :family parent)
+				     :size 2))
+		 (desktop-dont-save . t)
+		 (width . 2)
+		 (height . 1)))))
+      (set-window-buffer (frame-root-window emureader--flash-frame) buffer)
+      (set-window-dedicated-p (frame-root-window emureader--flash-frame) t)))
+  emureader--flash-frame)
+
+(defun emureader-flash-position (x y &optional window width height)
+  "Briefly mark the page fractions X, Y in WINDOW.
+
+With WIDTH and HEIGHT, also fractions of the page, highlight that box
+with X, Y as its top left corner; otherwise point an arrow at X, Y.
+The mark is shown for `emureader-flash-duration' seconds, in a child
+frame of WINDOW's frame, and only on graphical displays."
+  (let* ((window (or window (selected-window)))
+	 (parent (window-frame window))
+	 (edges (window-inside-pixel-edges window)))
+    (when (and (display-graphic-p parent)
+	       (not (frame-parent parent)))
+      (emureader--flash-hide)
+      (let* ((frame (emureader--flash-frame parent))
+	     (box (and width height))
+	     (from (emureader-page-fraction-to-window x y window))
+	     (to (and box (emureader-page-fraction-to-window
+			   (+ x width) (+ y height) window)))
+	     (char-w (frame-char-width parent))
+	     (char-h (frame-char-height parent))
+	     (left (if box (min (car from) (car to)) (- (car from) (* 2 char-w))))
+	     (top (if box (min (cdr from) (cdr to)) (- (cdr from) (/ char-h 2))))
+	     (pixel-w (if box (max 4 (abs (- (car to) (car from)))) (* 2 char-w)))
+	     (pixel-h (if box (max 4 (abs (- (cdr to) (cdr from)))) char-h))
+	     (frame-resize-pixelwise t))
+	(when (< -1 top (- (nth 3 edges) (nth 1 edges)))
+	  (with-current-buffer (window-buffer (frame-root-window frame))
+	    (let ((inhibit-read-only t))
+	      (erase-buffer)
+	      (unless box
+		(insert (propertize "➤" 'face
+				    `(:foreground ,(face-foreground 'emureader-flash nil t)
+						  :height ,(face-attribute 'default :height parent)
+						  :weight bold))))))
+	  (modify-frame-parameters
+	   frame
+	   `((background-color . ,(if box
+				      (face-background 'emureader-flash nil t)
+				    (face-background 'default parent)))
+	     (alpha . ,(if box emureader-flash-opacity 1.0))
+	     (left . ,(max 0 (+ (nth 0 edges) left)))
+	     (top . ,(max 0 (+ (nth 1 edges) top)))))
+	  (set-frame-size frame pixel-w pixel-h t)
+	  (make-frame-visible frame)
+	  (setq emureader--flash-timer
+		(run-with-timer emureader-flash-duration nil
+				#'emureader--flash-hide)))))))
 
 (defun emureader--clear-doc-memory ()
   "Clear document memory if we are in `emureader-mode'.
@@ -757,27 +1255,33 @@ This function is replaced as `revert-buffer-function' for
 	    (message "Reloading your document...Press C-g to stop.")
 	    (condition-case err
 		(progn
-		  (emureader--render-buffer (1- page))
+		  (emureader--render-buffer (1- page) t)
 		  (emureader-doc-scale-page scale)
 		  (emureader--center-page)
-		  (emureader--manage-window-overlays))
+		  (emureader--manage-window-overlays)
+		  ;; Record the new version, so that it is not
+		  ;; reverted again, e.g. by `auto-revert-mode'.
+		  (unless (file-remote-p buffer-file-name)
+		    (set-visited-file-modtime)))
 	      ((quit error)
 	       (message "Reloading interrupted; restoring display...")
 	       (emureader--restore-display-on-quit page scale)
 	       (signal (car err) (cdr err))))))
       (setq-local emureader--reloading nil))))
 
-(defun emureader--render-buffer (&optional page)
+(defun emureader--render-buffer (&optional page recheck)
   "Render the document file current buffer is associated with.
-Load the PAGE if provided."
+Load the PAGE if provided.  For a remote document, RECHECK non-nil
+fetches it again if it changed; see `emureader--local-file'."
   (interactive)
-  (if-let* ((file (buffer-file-name (current-buffer))))
+  (if-let* ((file (emureader--local-file recheck)))
       (when-let* ((_ (file-exists-p file))
 		  (page (if (numberp page) (max 0 page) 0)))
 	(emureader-dyn--load-doc file page)
 	;; emureader-dyn--load-doc resets the window state, which also
 	;; needs to be reflected in the frontend.
-	(set-window-parameter nil 'scale 1.0))
+	(set-window-parameter nil 'scale 1.0)
+	(set-window-parameter nil 'emureader-rotation 0))
     (message "No file associated with buffer.")))
 
 ;; We have an overlay per window, since we (naturally) need to be able
@@ -802,7 +1306,8 @@ It is hooked to `window-configuration-change-hook' to keep detecting."
   (let ((overlays (car (overlay-lists)))
 	(windows (get-buffer-window-list (current-buffer) nil t)))
     (mapc #'emureader--window-close-function overlays)
-    (mapc #'emureader--window-create-function windows)))
+    (mapc #'emureader--window-create-function windows)
+    (mapc #'emureader--fit-if-pending windows)))
 
 (defun emureader--window-create-function (window)
   "Create window overlay for WINDOW."
@@ -815,9 +1320,21 @@ It is hooked to `window-configuration-change-hook' to keep detecting."
 	(emureader-dyn--window-close old))
       (set-window-parameter window 'overlay nil)
       (emureader-dyn--window-create window)
+      (set-window-parameter window 'emureader-rotation 0)
       ;; Scale first so goto-page renders and centers once at the final scale.
       (emureader-doc-scale-page emureader--recent-scale-fallback)
-      (emureader-goto-page (or emureader--recent-pagenumber-fallback 1)))))
+      (let ((emureader--inhibit-page-change-hook t))
+	(emureader-goto-page (or emureader--recent-pagenumber-fallback 1)))))
+  (emureader--fit-if-pending window))
+
+(defun emureader--fit-if-pending (window)
+  "Fit the page to WINDOW if the document was opened without being shown."
+  (when (and (window-live-p window)
+	     (buffer-local-value 'emureader--fit-pending (window-buffer window))
+	     (emureader--window-owned-p window))
+    (with-selected-window window
+      (setq emureader--fit-pending nil)
+      (funcall emureader-default-fit))))
 
 (defun emureader--window-close-function (overlay)
   "Properly close the window belonging to OVERLAY."
@@ -840,10 +1357,12 @@ and ensures a valid overlay exists if the new buffer is a emureader buffer."
     (when (with-current-buffer (window-buffer window)
             (derived-mode-p 'emureader-mode))
       (unless (window-parameter window 'overlay)
-        (emureader--window-create-function window)))))
+        (emureader--window-create-function window))
+      (emureader--fit-if-pending window))))
 
 
 (declare-function emureader-outline-show "emureader-outline")
+(declare-function emureader-synctex-inverse-search "emureader-synctex")
 ;; We explicitly bind default keys because relying on the rebinding
 ;; mechanism can lead to them not being bound at all if users have
 ;; overridden the defaults with other commands.
@@ -912,6 +1431,10 @@ and ensures a valid overlay exists if the new buffer is a emureader buffer."
 
   "o"       #'emureader-outline-show
 
+  "C-c C-g" #'emureader-synctex-inverse-search
+  "C-<down-mouse-1>" #'ignore
+  "C-<mouse-1>" #'emureader-synctex-inverse-search
+
   "Q"       #'emureader-close-doc
 
 
@@ -940,13 +1463,19 @@ Keybindings:
 
   (emureader-ensure-module)
 
-  (unless (and buffer-file-name
-	       (file-exists-p buffer-file-name)
-	       (file-regular-p buffer-file-name)
-	       (file-readable-p buffer-file-name))
-    (message "EMuReader did not open the document: %s is not a valid file"
-             (or buffer-file-name "<no file>"))
-    (kill-buffer (current-buffer)))
+  ;; For a remote document this fetches the local copy.
+  (let ((file (condition-case err
+		  (emureader--local-file)
+		(error (message "%s" (error-message-string err)) nil))))
+    (unless (and file
+		 (file-exists-p file)
+		 (file-regular-p file)
+		 (file-readable-p file))
+      (let ((name (or buffer-file-name "<no file>")))
+	(kill-buffer (current-buffer))
+	;; Stop here: the rest of the body would act on another buffer.
+	(user-error "EMuReader did not open the document: %s is not a valid file"
+		    name))))
 
   (setq-local buffer-read-only t
 	      global-linum-mode nil
@@ -969,9 +1498,20 @@ Keybindings:
   (setq-local bookmark-make-record-function
 	      #'emureader-bookmark-make-record)
 
-  (unless (bound-and-true-p
-	   emureader-current-doc-render-status)
-    (emureader--render-buffer))
+  ;; When the document is opened without being shown, as by
+  ;; `find-file-noselect', the selected window shows another buffer:
+  ;; keep its scrolling, and fit the page once a window shows it.
+  (let* ((window (selected-window))
+	 (foreign (not (eq (window-buffer window) (current-buffer))))
+	 (hscroll (window-hscroll window))
+	 (vscroll (window-vscroll window t)))
+    (setq emureader--fit-pending foreign)
+    (unless (bound-and-true-p
+	     emureader-current-doc-render-status)
+      (emureader--render-buffer))
+    (when foreign
+      (set-window-hscroll window hscroll)
+      (set-window-vscroll window vscroll t)))
 
   (declare-function emureader--outline-imenu-goto "emureader-outline")
   (declare-function emureader--outline-imenu-create-index "emureader-outline")
@@ -980,7 +1520,8 @@ Keybindings:
 
   (run-hooks 'emureader-mode-hook)
 
-  (funcall emureader-default-fit)
+  (unless emureader--fit-pending
+    (funcall emureader-default-fit))
   (add-hook 'window-size-change-functions #'emureader--center-page nil t)
 
   ;;`bookmark--jump-via' messes up with centering, so we need to center again.

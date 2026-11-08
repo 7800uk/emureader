@@ -33,6 +33,7 @@
 		  (cons 'scale (emureader-current-doc-scale-value win))
 		  (cons 'hscroll (and win (emureader--window-hscroll win)))
 		  (cons 'vscroll (and win (window-vscroll win)))
+		  (cons 'emureader-name emureader-doc-name)
 		  '(handler . emureader-bookmark-jump)))))
 
 ;;;###autoload
@@ -42,8 +43,13 @@
         (file (bookmark-prop-get bookmark 'filename))
         (scale (bookmark-prop-get bookmark 'scale))
 	(hscroll (bookmark-prop-get bookmark 'hscroll))
-	(vscroll (bookmark-prop-get bookmark 'vscroll)))
-    (find-file file)
+	(vscroll (bookmark-prop-get bookmark 'vscroll))
+	(name (bookmark-prop-get bookmark 'emureader-name)))
+    ;; Remote documents and documents opened under a name of their
+    ;; own are opened as `emureader-open-doc' did.
+    (if (or name (file-remote-p file))
+	(emureader-open-doc file name)
+      (find-file file))
     (emureader--manage-window-overlays)
     (when scale (emureader-doc-scale-page scale))
     (when page (emureader-goto-page page))
