@@ -1,0 +1,153 @@
+#+TITLE: 7800uk fork of EμReader: feature specification
+#+OPTIONS: toc:nil
+
+This fork adds three features to EμReader.  Each requirement below has
+an identifier; the acceptance tests in [[file:../test/emureader-fork-tests.el][test/emureader-fork-tests.el]]
+and the manual checks recorded at the end of this file refer to them.
+
+The fork is pure Emacs Lisp: the C module is upstream's, unchanged, so
+any build of upstream's module at the same commit works with it.
+
+* T: TRAMP via a named local cache
+
+MuPDF opens documents by local path, so a remote document is copied to
+a local cache file and the copy is rendered.
+
+- T1 :: =emureader-open-doc= has the signature =(FILE &optional NAME)=.
+  FILE may be local or remote (=file-remote-p=).  Interactively, a
+  prefix argument also prompts for NAME.
+- T2 :: For a remote FILE the rendered file is
+  =<emureader-cache-directory>/<hash of FILE>/<NAME>=, where NAME
+  defaults to FILE's own non-directory name.  The cache file therefore
+  always has a real file name; NAME supplies the extension when FILE
+  has none (content-addressed storage).
+- T3 :: When neither NAME nor FILE has a supported extension, the
+  format is sniffed from the first bytes (=%PDF= → pdf, EPUB zip →
+  epub) and that extension is appended to the cache file name.
+- T4 :: The buffer represents FILE, not the cache: =buffer-file-name=
+  is FILE, the buffer name is NAME (made unique as usual), and
+  =emureader-cache-file= (buffer-local) holds the local copy.
+  Opening the same FILE again reuses the existing buffer.
+- T5 :: The cache copy is reused, without transferring, when its size
+  and modification time equal the remote file's (the copy keeps the
+  remote mtime).  Otherwise it is fetched again.
+- T6 :: Reverting the buffer (=g=, =revert-buffer=) re-checks the
+  remote file and re-fetches it if it changed; page and scale are kept
+  as for local files.
+- T7 :: =find-file= on a remote path whose name has a supported
+  extension opens it in =emureader-mode= through the same cache.  If the
+  buffer already holds the raw bytes undecoded, they are written to the
+  cache instead of being transferred a second time.
+- T8 :: =emureader-clear-cache= deletes the cache directory's contents,
+  except files rendered by live EμReader buffers (with a prefix
+  argument it deletes everything).
+- T9 :: Local files behave exactly as upstream: no cache is used.
+- T10 :: Bookmarks and save-place of remote documents record FILE and
+  NAME, so jumping to them reopens FILE under NAME.
+- T11 :: Nothing is ever written to the remote side.
+
+* S: SyncTeX (=emureader-synctex.el=)
+
+- S1 :: =emureader-synctex-forward-search= (=TEX= →
+  document): given a PDF, a TeX file and a line (and optional column)
+  it runs =synctex view -i LINE:COL:INPUT -o PDF=, displays the PDF in
+  EμReader (opening it if needed, in another window), goes to the
+  reported page, scrolls so the reported box is visible and briefly
+  highlights the box (a translucent child frame over the line, so it
+  works whatever the display arrangement).  A document shown in a
+  window for the first time is fitted to that window.
+- S2 :: =emureader-synctex-inverse-search= (document → TeX): from a
+  window position (a mouse event, or the window centre when invoked
+  from the keyboard) it computes page coordinates and runs =synctex edit
+  -o PAGE:X:Y:PDF=, then visits the reported input file at the reported
+  line (and column when known) in another window, keeping the document
+  in view.  Bound to =C-mouse-1= and =C-c C-g= in =emureader-mode=.
+- S3 :: Window pixel ↔ page point conversion uses the current scale,
+  rotation (0/90/180/270), horizontal centring offset and vertical
+  scroll; a forward search followed by an inverse search at the
+  highlighted spot returns the original line (within the same
+  paragraph/line box).
+- S4 :: An AUCTeX viewer named ="EμReader"= is added to
+  =TeX-view-program-list=, so
+  =(setq TeX-view-program-selection '((output-pdf "EμReader")))= makes
+  =C-c C-v= (with =TeX-source-correlate-mode=) do a forward search.
+  Without source correlation it just opens the PDF.
+- S5 :: Missing =synctex= binary or missing =.synctex.gz= gives a
+  =user-error=; it never signals an unhandled error.
+- S6 :: The file is loaded lazily: autoloads only; AUCTeX need not be
+  installed for it to byte-compile or load.
+
+* N: org-noter (=emureader-org-noter.el=)
+
+- N1 :: Requiring =emureader-org-noter= adds =emureader-mode= to
+  =org-noter-supported-modes= and "pdf"-style extensions to
+  =org-noter--doc-extensions=, and registers hook functions for:
+  approximate location, goto location, current view (='paged=),
+  pretty printing (property and title), document set-up, precise info,
+  selected text (none: returns nil), and skeleton creation.
+- N2 :: =M-x org-noter= from an EμReader buffer and from a notes
+  heading with =NOTER_DOCUMENT= both start a session whose document
+  buffer is in =emureader-mode=.
+- N3 :: Page changes in the document (any command: =n=, =p=, =SPC=,
+  goto, outline) call org-noter's location-change handler, so the notes
+  window follows the document.
+- N4 :: Locations are =(PAGE . V)= or =(PAGE V . H)= with V, H fractions
+  of the page; going to a location shows the page and scrolls V into
+  view.  =org-noter-insert-note= creates a note with the current page,
+  =org-noter-insert-precise-note= asks for a click and records V/H.
+- N5 :: =org-noter-create-skeleton= turns the document outline into
+  headings with the outline pages as locations.
+- N6 :: Sessions on remote documents (TRAMP paths in =NOTER_DOCUMENT=)
+  open through the cache and record the remote path.
+- N7 :: The file byte-compiles without org-noter installed (it then
+  does nothing).
+
+* G: General
+
+- G1 :: All =.el= files byte-compile without warnings with =make=.
+- G2 :: Upstream's checkdoc target passes for the new files.
+- G3 :: Code style and =read-symbol-shorthands= follow upstream.
+- G4 :: Opening a document without showing it (=find-file-noselect=,
+  =emureader-find-doc-noselect=) leaves the selected window's scrolling
+  alone and fits the page to the first window that shows it.
+
+* Verification record (2026-11-08)
+
+Batch: =make test= with org-noter, AUCTeX and
+=EMUREADER_TEST_REMOTE=/ssh:frp:/var/lib/altero/storage/c6/c6fc…=:
+12/12 pass; without them 8 pass, 4 skipped.  =make= byte-compiles and
+checkdocs every file without a warning, with and without org-noter and
+AUCTeX on the load path.
+
+Interactive, in GNU Emacs 31.1.50 (NS, two displays, frame scale 2),
+driven through =emacsclient= with screenshots:
+
+- T1, T2, T4 :: =emureader-open-doc= on an extension-less altero file
+  with NAME "Kripke - Naming and Necessity.pdf": buffer named NAME,
+  =buffer-file-name= remote, rendered from
+  =emureader-cache/<md5>/Kripke - Naming and Necessity.pdf= (1.5 MB in
+  3.5 s); opening it again reuses the buffer.
+- T3 :: without NAME the copy is called =<hash>.pdf=.
+- T5, T6 :: reopening after killing the buffer took 0.37 s and kept the
+  copy's inode; =revert-buffer= kept page and copy.
+- T7 :: =find-file= on =/ssh:frp:/nix/store/…/fontconfig-user.pdf=
+  opened in =emureader-mode=; the =no-conversion= buffer bytes were
+  written to the cache (no second transfer), md5 equal to the remote.
+- T8, T10 :: clearing kept the three live copies and removed the
+  stale one; a bookmark of the named remote document reopened it under
+  NAME at the recorded page.
+- S1–S4 :: forward search highlighted the right line at 0°, 90° and
+  270°; inverse search through the command loop (=C-mouse-1= events)
+  and the keyboard returned the original lines; =TeX-view= with the
+  "EμReader" viewer and =TeX-source-correlate-mode= went to the line's
+  page.
+- N1–N6 :: sessions from a notes heading and from the document;
+  =n=, goto and =p= ran the location-change handler; notes inserted with
+  =(PAGE)= and with a click =(2 0.6447 . 0.2512)=; syncing to them
+  turned and scrolled the document and pointed the arrow; the skeleton
+  had the outline's three sections and pages; a remote extension-less
+  =NOTER_DOCUMENT= opened through the cache.
+
+Not verified: a physical mouse click (clicks posted to a background
+NS window are dropped, so events were fed through the command loop);
+TRAMP methods other than ssh; formats other than PDF over TRAMP.

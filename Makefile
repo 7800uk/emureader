@@ -109,7 +109,7 @@ OBJS := $(SRCS:%.c=%.o)
 EL_SRCS := $(filter-out .* emureader-autoloads.el,$(wildcard *.el))
 ELC := $(EL_SRCS:%.el=%.elc)
 
-.PHONY: all clean checkdoc autoloads module
+.PHONY: all clean checkdoc autoloads module test
 
 all: $(LIB_NAME) emureader-autoloads.el $(ELC) checkdoc
 
@@ -132,6 +132,13 @@ emureader-autoloads.el: $(EL_SRCS)
 
 checkdoc: $(EL_SRCS)
 	$(EMACS) $(foreach file, $(EL_SRCS), --eval '(checkdoc-file "$(file)")')
+
+# Extra load path for the tests, e.g. TEST_LOAD_PATH="-L ../org-noter -L ../auctex".
+# EMUREADER_TEST_REMOTE names a remote document to fetch (read only).
+TEST_LOAD_PATH ?=
+
+test: $(ELC)
+	$(EMACS) $(TEST_LOAD_PATH) -l test/emureader-fork-tests.el -f ert-run-tests-batch-and-exit
 
 clean:
 	rm -f emureader-autoloads.el
